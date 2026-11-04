@@ -28,7 +28,6 @@ NOTE_COLUMN = "Full Note"
 
 # Batch size for generation.
 BATCH_SIZE = 8
-
 # Each note is split into overlapping chunks (see CHUNKING below)
 # before extraction, so individual prompts are much shorter than a
 # full note -- this token budget is mostly a safety net.
@@ -165,6 +164,20 @@ STRUCTURED HEADACHE TEMPLATES:
   10-12/month" -> use 10-12/month.
 - Never treat a generic "Frequency:" field outside a headache/migraine-specific
   block as headache frequency.
+
+ADDITIONAL REAL-WORLD FREQUENCY PATTERNS:
+- "Out of last 30 days only 3 headache" = 3/month.
+- "23-24 headache-free days in last 30" = 6-7 headache days/month.
+- "0 headache-free days in last 30" = daily = 28/month.
+- "a few migraines per month" = 2-3/month; "a couple migraines/month" = 2/month.
+- "every other day" / "bidaily" = 14/month; "six days/week" = 24/month.
+- Keep headache and migraine frequencies separate when both are explicitly stated.
+- Prefer current/now/interval-history values over prior, baseline, pre-treatment,
+  "used to", or older dated values.
+- Do not multiply attack frequency by duration. "4 migraine attacks/month lasting
+  2-3 days" remains 4 attacks/month unless headache DAYS are explicitly stated.
+- If an explicit total headache-day count is present, prefer it for overall
+  headache frequency over a severe-headache subset.
 
 CURRENT FREQUENCY:
 - Use the most recent/current frequency.
@@ -1052,6 +1065,122 @@ def _extract_qualitative_current_headache_frequency(note):
 
     return None, None
 
+def _extract_v7_string_patterns(note):
+    """High-precision rescue rules for additional real-world headache strings."""
+    r={"headache":None,"migraine":None,"headache_priority":0,"migraine_priority":0,"evidence":[]}
+    if not isinstance(note,str): return r
+    t=re.sub(r"[ \t]+"," ",note)
+
+    def setv(kind,val,p,ev):
+        key=kind+"_priority"
+        if p>r[key]:
+            r[kind]=val; r[key]=p
+            r["evidence"].append(f"V7 {kind.upper()} -> {val}: {ev}")
+
+    def wk(a,b=None):
+        a=float(a)*4
+        b=float(b)*4 if b else None
+        f=lambda x:str(int(x)) if x.is_integer() else f"{x:g}"
+        return f"{f(a)}-{f(b)}/month" if b is not None else f"{f(a)}/month"
+
+    # Explicit headache-day counts and current headache-frequency fields.
+    pats=[
+      r"(?i)\bout\s+of\s+(?:the\s+)?last\s+(?:28|30|31)\s+days?\s+only\s+(\d+)\s+headaches?",
+      r"(?i)\b(?:total\s+)?#?\s*h/?a\s+days?\s+per\s+month\s*:\s*(\d+)(?:\s*-\s*(\d+))?",
+      r"(?i)\btotal\s+headache\s+days?\s+per\s+month\s*:\s*(\d+)(?:\s*/\s*(?:28|30|31))?",
+      r"(?i)\baverage\s+number\s+of\s+headache\s+days?\s+per\s+month\s*:\s*(\d+)",
+      r"(?i)\b(?:has|reports?)\s+(\d+)\s+headache\s+days?\s+(?:a|per)\s+month\b",
+      r"(?i)\bcurrent\s+headache\s+frequency\s*:\s*-?\s*(\d+)(?:\s*-\s*(\d+))?\s+headache\s+days?\s+(?:per|pe)\s+month\b",
+    ]
+    for pat in pats:
+        for m in re.finditer(pat,t):
+            a=m.group(1); b=m.group(2) if (m.lastindex or 0)>=2 else None
+            val=f"{a}-{b}/month" if b else f"{a}/month"
+            setv("headache",val,540,m.group(0))
+
+    # Headache-free days in a stated 30-day interval.
+    m=re.search(r"(?i)headache[- ]free\s+days?\s+in\s+last\s+30\s*:?\s*(\d+)(?:\s*-\s*(\d+))?",t)
+    if m:
+        lo=float(m.group(1)); hi=float(m.group(2)) if m.group(2) else lo
+        a=30-hi; b=30-lo
+        f=lambda x:str(int(x)) if x.is_integer() else f"{x:g}"
+        val=f"{f(a)}-{f(b)}/month" if a!=b else f"{f(a)}/month"
+        setv("headache",val,545,m.group(0))
+
+    # Explicit migraine days/attacks/month.
+    mpats=[
+      r"(?i)\b(\d+)(?:\s*-\s*(\d+))?\s+migraine\s+days?\s+(?:a|per)\s+month\b",
+      r"(?i)\b(\d+)(?:\s*-\s*(\d+))?\s+migraine\s+attacks?\s+(?:a|per)\s+month\b",
+      r"(?i)\b(?:has|gets?|experiences?|reports?)\s+(\d+)(?:\s*-\s*(\d+))?\s+migraines?\s+(?:a|per)\s+month\b",
+      r"(?i)\bcurrent\s+headache\s+frequency\s*:\s*(\d+)(?:\s*-\s*(\d+))?\s+migraines?\s+(?:in\s+a|per)\s+month\b",
+    ]
+    for pat in mpats:
+        for m in re.finditer(pat,t):
+            a,b=m.group(1),m.group(2)
+            val=f"{a}-{b}/month" if b else f"{a}/month"
+            setv("migraine",val,535,m.group(0))
+            setv("headache",val,300,m.group(0))
+
+    # Entity-first weekly numeric expressions.
+    ep=re.compile(r"(?i)\b(migraines?|headaches?|tension\s+headaches?|h/?a)\b.{0,60}?(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?\s*(?:x|times?|days?)?\s*(?:/|per\s+|a\s+)?(?:week|wk)\b")
+    for m in ep.finditer(t):
+        val=wk(m.group(2),m.group(3)); ent=m.group(1).lower()
+        if "migraine" in ent:
+            setv("migraine",val,500,m.group(0)); setv("headache",val,280,m.group(0))
+        else: setv("headache",val,500,m.group(0))
+
+    # Numeric-first weekly expressions.
+    np=re.compile(r"(?i)\b(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?\s*(?:x|times?|days?)?\s*(?:/|per\s+|a\s+)?(?:week|wk).{0,25}?\b(migraines?|headaches?)\b")
+    for m in np.finditer(t):
+        val=wk(m.group(1),m.group(2))
+        if "migraine" in m.group(3).lower():
+            setv("migraine",val,505,m.group(0)); setv("headache",val,285,m.group(0))
+        else: setv("headache",val,505,m.group(0))
+
+    # Word-number frequencies.
+    for pat,val,kind in [
+      (r"(?i)\b(?:migraines?|migraine)\b.{0,60}\bonce\s+(?:a|per)\s+week\b","4/month","migraine"),
+      (r"(?i)\b(?:headaches?|headache)\b.{0,60}\bonce\s+(?:a|per)\s+week\b","4/month","headache"),
+      (r"(?i)\bone\s+migraine\s+weekly\b","4/month","migraine"),
+      (r"(?i)\bmigraines?\b.{0,60}\b(?:a\s+few|few)\s+times?\s+per\s+month\b","2-3/month","migraine"),
+      (r"(?i)\b(?:a\s+couple|couple)\s+(?:of\s+)?migraines?\s+(?:a|per)\s+month\b","2/month","migraine"),
+    ]:
+        m=re.search(pat,t)
+        if m:
+            setv(kind,val,480,m.group(0))
+            if kind=="migraine": setv("headache",val,270,m.group(0))
+
+    # Every-other-day / six-days-weekly / every-other-day-to-daily.
+    m=re.search(r"(?i)\bcurrent\s+headache\s+frequency\s*:\s*every\s+other\s+day\s+to\s+every\s+day\b",t)
+    if m:setv("headache",f"14-{DAYS_PER_MONTH}/month",530,m.group(0))
+    for pat,val in [
+      (r"(?i)\bheadaches?.{0,60}\bevery\s+other\s+day\b","14/month"),
+      (r"(?i)\b(?:almost\s+)?bidaily\s+headaches?\b","14/month"),
+      (r"(?i)\bheadaches?.{0,80}\bsix\s+days\s+a\s+week\b","24/month"),
+    ]:
+        m=re.search(pat,t)
+        if m:setv("headache",val,470,m.group(0))
+
+    # Strong daily/constant phrases.
+    for pat in [
+      r"(?i)\bconstant\s+24\s*-\s*7\s+headache\b",
+      r"(?i)\bheadache\s+is\s+constant\s+daily\b",
+      r"(?i)\bhas\s+(?:a\s+)?headache\s+every\s+day\b",
+      r"(?i)\breports?\s+daily\s+headaches?\b",
+      r"(?i)\bhas\s+not\s+had\s+a\s+complete\s+headache[- ]free\s+interval\b",
+      r"(?i)\bcannot\s+remember\s+having\s+a\s+true\s+headache[- ]free\s+day\b",
+      r"(?i)\bheadaches?\s+close\s+to\s+daily\b",
+      r"(?i)\bnear\s+constant\s+daily\s+low\s+grade\s+headache\b",
+    ]:
+        m=re.search(pat,t)
+        if m:setv("headache",f"{DAYS_PER_MONTH}/month",460,m.group(0)); break
+
+    # Explicit current zero headache in recent interval.
+    m=re.search(r"(?i)\b(?:last|past)\s+month.{0,80}?(?:hasn'?t|has\s+not|had\s+no)\s+(?:had\s+)?any\s+headaches?\b",t)
+    if m:setv("headache","0/month",600,m.group(0))
+
+    return r
+
 def deterministic_frequency_evidence_v3(note):
     """
     High-precision rescue layer.
@@ -1072,6 +1201,16 @@ def deterministic_frequency_evidence_v3(note):
     }
     if not isinstance(note, str) or not note.strip():
         return result
+
+    # V7 high-precision real-world string patterns.
+    v7 = _extract_v7_string_patterns(note)
+    if v7["headache"] is not None:
+        result["headache"] = v7["headache"]
+        result["headache_priority"] = v7["headache_priority"]
+    if v7["migraine"] is not None:
+        result["migraine"] = v7["migraine"]
+        result["migraine_priority"] = v7["migraine_priority"]
+    result["evidence"].extend(v7["evidence"])
 
     is_migraine_phenotype, migraine_evidence = (
         _note_identifies_current_headache_phenotype_as_migraine(note)
