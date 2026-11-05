@@ -1,6 +1,8 @@
 import pandas as pd
 import torch
 import re
+import os
+import traceback
 from tqdm.auto import tqdm
 
 from transformers import (
@@ -19,20 +21,26 @@ from transformers import (
 DAYS_PER_MONTH = 28
 
 
-MODEL_NAME = "NousResearch/Nous-Hermes-2-Mistral-7B-DPO"
+MODEL_NAME = "Qwen/Qwen3-14B"
 
-INPUT_FILE = "/media/Datacenter_storage/LLM_apigee/SampleNotes_HdFreq_MigraineFreq_Annotated_P3_LLM_output.csv"
-OUTPUT_FILE = "/media/Datacenter_storage/LLM_apigee/SampleNotes_HdFreq_MigraineFreq_Annotated_P3_LLM_outputIB.csv"
+INPUT_FILE = "/media/Datacenter_storage/LLM_apigee/update_cd_noPHI_version2.xlsx"
+OUTPUT_FILE = "/media/Datacenter_storage/LLM_apigee/update_cd_noPHI_version2_Qwen.csv"
 
-NOTE_COLUMN = "Full Note"
+# Robust/resumable output settings.
+CHECKPOINT_EVERY_BATCHES = 1
+SAVE_PARTIAL_ON_ERROR = True
+
+
+NOTE_COLUMN = "String"
 
 # Batch size for generation.
-BATCH_SIZE = 8
+BATCH_SIZE = 4
+
 # Each note is split into overlapping chunks (see CHUNKING below)
 # before extraction, so individual prompts are much shorter than a
 # full note -- this token budget is mostly a safety net.
 MAX_INPUT_TOKENS = 3000
-MAX_NEW_TOKENS = 80
+MAX_NEW_TOKENS = 220
 
 # ------------------------------------------------------
 # CHUNKING
@@ -52,11 +60,57 @@ CHUNK_CHARS = 3000
 CHUNK_OVERLAP_CHARS = 300
 
 
+
+# ======================================================
+# ROBUST / ATOMIC SAVING
+# ======================================================
+
+def ensure_output_directory(output_file):
+    """Create the output directory if it does not already exist."""
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    os.makedirs(output_dir, exist_ok=True)
+
+
+def save_checkpoint(dataframe, output_file, label="checkpoint"):
+    """
+    Atomically save the current dataframe.
+
+    The CSV is first written to '<output>.tmp' and then moved into place.
+    This avoids leaving a partially written CSV if the process is interrupted
+    during the write itself.
+    """
+    ensure_output_directory(output_file)
+
+    tmp_file = output_file + ".tmp"
+    dataframe.to_csv(tmp_file, index=False)
+    os.replace(tmp_file, output_file)
+
+    size_bytes = os.path.getsize(output_file)
+    print(
+        f"[SAVE] {label}: {len(dataframe):,} rows -> "
+        f"{output_file} ({size_bytes:,} bytes)"
+    )
+
+
+def safe_partial_save(dataframe, output_file, label="partial save"):
+    """Best-effort save used during exception handling."""
+    try:
+        save_checkpoint(dataframe, output_file, label=label)
+    except Exception as save_error:
+        print(
+            f"[SAVE ERROR] Could not write partial output to {output_file}: "
+            f"{type(save_error).__name__}: {save_error}"
+        )
+
+
 # ======================================================
 # LOAD DATA
 # ======================================================
 
-df = pd.read_csv(INPUT_FILE)
+if INPUT_FILE.lower().endswith((".xlsx", ".xls")):
+    df = pd.read_excel(INPUT_FILE)
+else:
+    df = pd.read_csv(INPUT_FILE)
 print(f"Number of rows: {len(df):,}")
 
 if NOTE_COLUMN not in df.columns:
@@ -90,6 +144,9 @@ def clean_text(text):
 
 print("Cleaning non-ASCII characters from notes...")
 df[NOTE_COLUMN] = df[NOTE_COLUMN].apply(clean_text)
+
+# Validate output path before expensive model inference.
+save_checkpoint(df, OUTPUT_FILE, label="initial cleaned input")
 
 
 # ======================================================
@@ -132,199 +189,50 @@ def chunk_text(text, chunk_size=CHUNK_CHARS, overlap=CHUNK_OVERLAP_CHARS):
 # ======================================================
 
 DEFAULT_PROMPT = """
-You are a clinical NLP model extracting CURRENT headache and migraine frequency.
+You are a clinical NLP extractor. Extract the CURRENT overall headache
+frequency and CURRENT migraine frequency from the clinical text.
 
-Your task is to identify the CURRENT frequency from the clinical text.
+Work evidence-first:
+1. Identify the exact source phrase for overall headache frequency.
+2. Identify the exact source phrase for migraine frequency.
+3. Determine whether each phrase is CURRENT, HISTORICAL, or UNCLEAR.
+4. Normalize CURRENT frequency to a 28-day/month convention.
 
-IMPORTANT:
-- Extract explicit frequency expressions even when the surrounding text is incomplete.
-- A frequency does not need to be immediately next to "headache" or "migraine".
-- Recognize:
-  - 1x/week
-  - 1-2x/week
-  - 1x a week
-  - 1-2x a week
-  - once a week
-  - twice a week
-  - 3 times per month
-  - 10 headache days/month
-  - 4 migraine days in the past month
-  - daily
-  - every 2 days
+CRITICAL RULES:
+- Prefer current/now/interval-history information over prior, baseline,
+  pre-treatment, "used to", or older dated information.
+- Prefer a dedicated current structured field such as "Current headache
+  frequency", "# headache days per month", "Total headache days per month",
+  or "Summary of headache: Frequency" over less specific narrative text.
+- Headache and migraine frequency are NOT automatically the same.
+- If the note gives total headache days plus a migraine/severe subset, keep
+  them separate.
+- Migraine attacks are headaches, but do not replace a clearly documented
+  overall headache-day frequency with a less frequent migraine subset.
+- Do not multiply attack frequency by duration. Example: 4 migraine
+  attacks/month lasting 2-3 days = 4 attacks/month unless headache DAYS are
+  explicitly documented.
+- Do not use medication schedules, treatment frequency, follow-up intervals,
+  family/social history, or unrelated symptom frequency.
+- Do not confuse duration with frequency.
+- "daily", "every day", chronic daily headache, constant/continuous headache
+  = 28/month under this project's 28-day convention.
+- every other day/bidaily = 14/month.
+- weekly = 4/month; once/week = 4/month; 2-3/week = 8-12/month.
+- "a couple" = 2; "a few" = 2-3 when explicitly describing attacks/month.
+- X headache-free days in the last 30 can be converted to 30-X affected days.
+- If current documentation says no headaches in the last month, headache
+  frequency is 0/month even if prior headache history was frequent.
+- A diagnosis of chronic migraine alone does NOT mean 28 migraine days/month.
 
-STRUCTURED HEADACHE TEMPLATES:
-- Clinical notes may contain a block such as "Summary of headache:" followed
-  several lines later by "Frequency: 10-12/month".
-- Within a headache/migraine summary block, the "Frequency:" field describes
-  the headache phenotype even though the word headache is not repeated on
-  that line.
-- Prefer this dedicated structured Frequency field over a less precise nearby
-  narrative approximation.
-- Example: "currently 2-3/week" plus later "Summary of headache ... Frequency:
-  10-12/month" -> use 10-12/month.
-- Never treat a generic "Frequency:" field outside a headache/migraine-specific
-  block as headache frequency.
-
-ADDITIONAL REAL-WORLD FREQUENCY PATTERNS:
-- "Out of last 30 days only 3 headache" = 3/month.
-- "23-24 headache-free days in last 30" = 6-7 headache days/month.
-- "0 headache-free days in last 30" = daily = 28/month.
-- "a few migraines per month" = 2-3/month; "a couple migraines/month" = 2/month.
-- "every other day" / "bidaily" = 14/month; "six days/week" = 24/month.
-- Keep headache and migraine frequencies separate when both are explicitly stated.
-- Prefer current/now/interval-history values over prior, baseline, pre-treatment,
-  "used to", or older dated values.
-- Do not multiply attack frequency by duration. "4 migraine attacks/month lasting
-  2-3 days" remains 4 attacks/month unless headache DAYS are explicitly stated.
-- If an explicit total headache-day count is present, prefer it for overall
-  headache frequency over a severe-headache subset.
-
-CURRENT FREQUENCY:
-- Use the most recent/current frequency.
-- Ignore historical frequencies if a current frequency is available.
-- Do not add frequencies together.
-- TRANSITION PHRASES: When the note describes a change over time using
-  phrasing like "was having X but now Y", "previously X, now down to Y",
-  "used to be X, currently Y", or similar before/after language, ALWAYS
-  use the LATER value (Y) as the current frequency. Do not use the
-  earlier value (X) and do not average X and Y.
-  Example: "was having 4+/week but now down to 1-2/week in the past
-  month" -> current frequency is 1-2/week (i.e. 4-8/month), NOT 4+/week.
-
-NON-HEADACHE FREQUENCIES:
-- Only extract frequencies that describe headache or migraine episodes
-  themselves.
-- Do NOT use frequencies that describe a different, separate symptom
-  or event, even if it appears near headache/migraine text or its
-  relationship to headache/migraine is uncertain (e.g. "~4/month of
-  unusual body posturing", "dizziness 2x/week", "nausea daily" when
-  these are described as their own distinct symptom rather than a
-  headache/migraine episode).
-- If the note itself says the relationship between another symptom
-  and headache/migraine is "unclear" or "unrelated", do not use that
-  symptom's frequency for headache or migraine frequency.
-
-HEADACHE VS MIGRAINE:
-- If headache and migraine refer to the same underlying clinical event,
-  use the same current frequency for both.
-- If the note clearly distinguishes headache frequency from migraine
-  frequency, report them separately.
-- Do not create separate frequencies merely because both words appear.
-
-TEMPORAL / EVIDENCE PRIORITY:
-- Extract the patient's CURRENT or most recently documented actual frequency.
-- Prefer assessment/HPI statements about current burden over copied problem-list,
-  diagnosis, medication instructions, templated education, or historical text.
-- "Before treatment", "previously", "used to", "at baseline", "prior to Botox",
-  and similar phrases are historical unless explicitly stated to still be current.
-- "Now", "currently", "since starting", "over the last/past 4 weeks/month",
-  "at present", and the latest follow-up statement indicate current status.
-- Do NOT use medication-use limits or instructions as disease frequency:
-  examples: "Nurtec every other day", "sumatriptan max 2 days/week",
-  "Botox every 12 weeks", "take BID", "may repeat in 2 hours".
-- Do NOT use planned/target frequencies ("goal <4/month", "should limit to
-  2 days/week") as observed frequency.
-- Do NOT use family history or another person's frequency.
-- If multiple current values conflict and the text does not establish which is
-  newer or which refers to headache vs migraine, return Not mentioned rather
-  than guessing.
-
-HEADACHE-DAY VS MIGRAINE-DAY SEMANTICS:
-- "headache days" / overall headache burden -> Headache frequency.
-- "migraine days", "migraines", or a clearly migraine/severe subset -> Migraine frequency.
-- Do NOT automatically copy a headache-day value into migraine frequency.
-- Do NOT automatically copy a migraine-day value into headache frequency unless
-  the note clearly uses headache and migraine interchangeably for the same events.
-- If the note says "20 headache days, 8 migraine days per month", output 20 and 8.
-- If it says "daily headache, with 8 migraines/month", output 30 and 8.
-- If it says only "8 migraines/month", migraine=8/month; headache is Not mentioned
-  unless the note establishes that every headache is a migraine.
-
-NORMALIZATION PRIORITY:
-- Prefer an explicit numeric frequency when it refers to the SAME event class
-  and SAME current time frame. Do not let a numeric severe/migraine subset
-  override an overall daily headache pattern. Example: "daily headache; severe
-  migraines 8/month" means headache=30/month and migraine=8/month.
-- Only apply the generic normalizations below when NO explicit
-  numeric frequency is stated for that headache type.
-
-NORMALIZATION (use only when no explicit number is given):
-1/week = 4/month
-1-2/week = 4-8/month
-2-3/week = 8-12/month
-1/day = 28/month
-2/day = 56/month
-X/month = X/month
-X over 4 weeks = X/month
-X over 28 days = X/month
-chronic daily headache (no other number given) = 28/month
-daily headache (no other number given) = 28/month
-daily (no other number given) = 28/month
-weekly (no number given) = 4/month
-monthly (no number given) = 1/month
-
-VAGUE OR NON-NUMERIC FREQUENCY DESCRIPTIONS:
-Clinical notes often describe frequency with qualitative phrases
-instead of a number. Some of these imply a specific frequency and
-should be converted; others do not quantify frequency at all and must
-be left as "Not mentioned" rather than guessed.
-
-- Phrases that describe the headache/migraine itself as happening
-  continuously or nearly every day are equivalent to daily and should
-  be normalized to 30/month. This includes:
-  - "continuous" / "constant" / "all the time"
-  - "most of the time" / "most of the day"
-  - "hemicrania continua" (continuous by definition)
-- IMPORTANT: "chronic migraine" alone is NOT a numeric frequency. Do NOT
-  convert the diagnosis "chronic migraine" to 30/month. Only quantify it
-  when the note separately states a frequency (e.g. 20 headache days/month,
-  8 migraine days/month, daily headache).
-- Phrases that describe treatment response, severity, or clinical
-  course -- NOT how often the headache/migraine occurs -- do NOT imply
-  a frequency and must be left as "Not mentioned" unless an actual
-  frequency is stated elsewhere in the text. Do not infer a frequency
-  from phrases like:
-  - "well controlled" / "well managed" / "stable on current regimen"
-  - "occasional breakthrough" / "rare flare" with no number given
-  - "improved" / "worsened" / "recently recurred" with no number given
-- If a single passage combines both (e.g. "well controlled, but she
-  still has a mild headache most of the time"), use only the part that
-  actually describes occurrence ("most of the time" -> 28/month); do
-  not let the control/severity language change that number or cause
-  you to output "Not mentioned" instead.
-
-MIXED CASES:
-- A note may describe an underlying near-daily/chronic headache
-  PLUS a distinct, more severe subset with its own explicit frequency
-  (e.g. "headache almost daily... about 3-4 days a week he gets a
-  severe headache he calls migraine" or "daily, severe ones 12-16/month").
-  In this case:
-  - Headache frequency: use daily/chronic normalization (28/month)
-    for the overall headache pattern, since it is described as
-    daily/near-daily.
-  - Migraine frequency: use the explicit number given for the
-    severe/migraine subset (e.g. 12-16/month, or 3-4/week -> 12-16/month).
-- Do not average or combine the daily pattern and the explicit
-  severe-subset number into a single figure.
-chronic daily headache = 28/month
-daily headache = 28/month
-
-Do not confuse duration with frequency.
-
-"headaches last 4 hours" = NOT frequency
-"headaches occur 2x/week" = frequency
-"She has had chronic daily headache for years." = 28/month (daily is normalized to a 28-day observation window; the duration "for years" is history, not frequency, and should be ignored)
-
-OUTPUT EXACTLY THREE LINES:
+Return EXACTLY these six lines and nothing else:
 
 Headache frequency: <value>/month OR Not mentioned
+Headache evidence: <short exact source phrase OR Not mentioned>
+Headache temporal status: <CURRENT|HISTORICAL|UNCLEAR>
 Migraine frequency: <value>/month OR Not mentioned
-Evidence: <short exact phrase from the clinical text supporting the CURRENT values>
-
-If truly not documented:
-
-Headache frequency: Not mentioned
-Migraine frequency: Not mentioned
+Migraine evidence: <short exact source phrase OR Not mentioned>
+Migraine temporal status: <CURRENT|HISTORICAL|UNCLEAR>
 
 Clinical text:
 {context}
@@ -489,13 +397,771 @@ def run_deterministic_self_tests():
     return all_ok
 
 
+
+# ======================================================
+# V9 HIGH-RECALL CANDIDATE -> VERIFY -> RESCUE PIPELINE
+# ======================================================
+
+FREQUENCY_ANCHOR_RE = re.compile(
+    r"""(?ix)
+    \b(?:daily|every\s+day|everyday|weekly|monthly|constant|continuous|
+       headache[- ]free|most\s+of\s+the\s+time|almost\s+daily|
+       nearly\s+daily|every\s+other\s+day|bidaily|few|couple|once|twice)\b
+    |
+    \b\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*
+       (?:x|times?|days?|attacks?)?\s*
+       (?:/|per\s+|a\s+)?(?:week|wk|month|mo|day)\b
+    |
+    \b\d+(?:\.\d+)?\s*/\s*(?:28|30|31)\s*(?:days?)?\b
+    """
+)
+
+HEADACHE_TERMS_RE = re.compile(
+    r"(?i)\b(?:headaches?|h/?a|cephalgia|head\s+pain|headache\s+days?)\b"
+)
+
+MIGRAINE_TERMS_RE = re.compile(
+    r"""(?ix)\b(?:
+        migraines?|migraine\s+attacks?|migraine\s+days?|
+        migrainous|debilitating\s+headaches?|severe\s+headaches?|
+        bad\s+migraines?|complicated\s+migraine|
+        episodic\s+migraine|chronic\s+migraine
+    )\b"""
+)
+
+EXCLUDE_CONTEXT_RE = re.compile(
+    r"""(?ix)\b(?:
+        take|tablet|capsule|dose|dosing|medication|maximum|max|
+        refill|injection|botox\s+every|follow[- ]?up|f/u|
+        family\s+history|mother|father|sister|brother|
+        exercise|alcohol|smoking
+    )\b"""
+)
+
+
+def _sentence_spans(text):
+    """Simple clinical sentence/line segmentation preserving source wording."""
+    if not isinstance(text, str):
+        return []
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def retrieve_frequency_windows(note, entity, radius=2):
+    """
+    High-recall retrieval. Regex retrieves evidence; it does NOT decide the
+    final frequency. This intentionally over-retrieves, then Qwen verifies.
+    """
+    sents = _sentence_spans(note)
+    if not sents:
+        return []
+
+    entity_re = MIGRAINE_TERMS_RE if entity == "migraine" else HEADACHE_TERMS_RE
+    hit_idx = set()
+
+    for i, sent in enumerate(sents):
+        has_freq = bool(FREQUENCY_ANCHOR_RE.search(sent))
+        has_entity = bool(entity_re.search(sent))
+
+        # Strong direct hit.
+        if has_freq and has_entity:
+            hit_idx.add(i)
+
+        # Frequency-only lines such as "Frequency: 10-12/month" are retained
+        # when adjacent to an entity-specific heading/sentence.
+        if has_freq:
+            lo = max(0, i - 2)
+            hi = min(len(sents), i + 3)
+            neighborhood = " ".join(sents[lo:hi])
+            if entity_re.search(neighborhood):
+                hit_idx.add(i)
+
+        # Structured fields can be entity-free on the same line.
+        if re.search(
+            r"(?i)\b(?:current\s+headache\s+frequency|frequency|"
+            r"headache\s+days?\s+per\s+month|migraine\s+days?\s+per\s+month|"
+            r"headache[- ]free\s+days?)\s*:",
+            sent,
+        ):
+            hit_idx.add(i)
+
+    windows = []
+    seen = set()
+    for i in sorted(hit_idx):
+        lo = max(0, i - radius)
+        hi = min(len(sents), i + radius + 1)
+        window = " ".join(sents[lo:hi]).strip()
+        if window and window not in seen:
+            seen.add(window)
+            windows.append(window)
+
+    return windows
+
+
+CANDIDATE_PROMPT = """
+You are performing HIGH-RECALL candidate retrieval for {entity} frequency.
+
+Do NOT choose the final answer yet.
+Find every passage that could possibly quantify the PATIENT'S {entity}
+occurrence, including uncertain candidates.
+
+Include:
+- numeric weekly/monthly/daily frequency
+- headache/migraine days
+- attacks
+- once/twice/few/couple
+- daily/constant/continuous/near-daily
+- headache-free-day statements
+- severe/debilitating headache subsets when evaluating migraine
+
+Exclude obvious medication dosing, family history, follow-up schedules, and
+duration-only statements.
+
+Return one candidate per line exactly as:
+CANDIDATE: <verbatim evidence>
+
+If none:
+CANDIDATE: NONE
+
+TEXT:
+{context}
+"""
+
+
+VERIFY_PROMPT = """
+You are verifying ONE candidate for CURRENT {entity} frequency.
+
+Candidate evidence:
+{candidate}
+
+Local source context:
+{context}
+
+Classify it carefully.
+
+ENTITY:
+- Does this quantify the patient's {entity} occurrence?
+- For migraine, generic headache frequency is NOT sufficient.
+- Explicit migraine terminology is strongest evidence.
+- A severe/debilitating/bad headache frequency may count as migraine when the
+  SAME LOCAL PASSAGE explicitly links that subset to migraine.
+- A generic headache frequency may count as migraine when the SAME LOCAL
+  structured passage, assessment, or transition clearly establishes that the
+  quantified headaches are the migraine phenotype.
+- Example: "Assessment: migraine without aura ... currently 1-2 headaches/week"
+  can support migraine frequency when this is one continuous local phenotype.
+- Example: "headache becomes throbbing migraine ... 5-10 days/month" can support
+  migraine frequency when the frequency describes that linked phenotype.
+- Do NOT infer migraine frequency merely from a remote problem-list/PMH/family
+  history migraine diagnosis elsewhere in the note.
+- For headache, migraine attacks may count as headache occurrence only when no
+  separate overall headache burden contradicts that interpretation.
+
+TEMPORAL:
+- CURRENT = current/now/latest interval/last month/present burden.
+- HISTORICAL = used to, prior to treatment, baseline, old dated history.
+- UNCLEAR = cannot establish current status.
+
+TYPE:
+- FREQUENCY = occurrence count/rate.
+- DURATION = how long an attack lasts.
+- MEDICATION = treatment schedule/use limit.
+- OTHER = unrelated.
+
+Extract the raw frequency phrase WITHOUT doing arithmetic.
+
+Return EXACTLY:
+Valid: <YES|NO>
+Temporal: <CURRENT|HISTORICAL|UNCLEAR>
+Type: <FREQUENCY|DURATION|MEDICATION|OTHER>
+Raw frequency: <verbatim frequency phrase OR Not mentioned>
+Evidence: <short verbatim evidence>
+"""
+
+
+RESCUE_PROMPT = """
+The first-pass pipeline did NOT find a CURRENT {entity} frequency.
+
+Search aggressively for any missed CURRENT {entity} frequency in this clinical
+text. This is a recall-rescue pass.
+
+Look for:
+- days/month, attacks/month
+- x/week, times/week
+- daily, every day, constant, continuous
+- every other day, near daily
+- once/twice/few/couple
+- headache-free days
+- structured Frequency fields
+- severe/debilitating subset ONLY if explicitly linked to migraine
+- explicit migraine/migrainous wording near the quantified frequency
+- transitions such as "used to X, now Y"
+
+For MIGRAINE rescue specifically:
+- Do NOT use generic headache frequency.
+- Do NOT use a severe/debilitating headache count unless the source explicitly
+  says those severe/debilitating events are migraines.
+- A migraine diagnosis elsewhere in the note does not make every headache a
+  migraine.
+
+Reject medication schedules, duration, family history, and historical-only
+values.
+
+Return EXACTLY:
+{label} frequency: <normalized value>/month OR Not mentioned
+{label} evidence: <short exact evidence OR Not mentioned>
+{label} temporal status: <CURRENT|HISTORICAL|UNCLEAR>
+
+Clinical text:
+{context}
+"""
+
+
+def parse_candidate_lines(output):
+    if not isinstance(output, str):
+        return []
+    vals = []
+    for line in output.splitlines():
+        m = re.match(r"\s*CANDIDATE\s*:\s*(.+)", line, flags=re.I)
+        if m:
+            v = m.group(1).strip()
+            if v.upper() != "NONE":
+                vals.append(v)
+    return vals
+
+
+def parse_verified_candidate(output):
+    result = {
+        "valid": False,
+        "temporal": "UNCLEAR",
+        "type": "OTHER",
+        "raw_frequency": None,
+        "evidence": None,
+    }
+    if not isinstance(output, str):
+        return result
+
+    patterns = {
+        "valid": r"(?im)^\s*Valid\s*:\s*(YES|NO)",
+        "temporal": r"(?im)^\s*Temporal\s*:\s*(CURRENT|HISTORICAL|UNCLEAR)",
+        "type": r"(?im)^\s*Type\s*:\s*(FREQUENCY|DURATION|MEDICATION|OTHER)",
+        "raw_frequency": r"(?im)^\s*Raw\s+frequency\s*:\s*(.+)$",
+        "evidence": r"(?im)^\s*Evidence\s*:\s*(.+)$",
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, output)
+        if not m:
+            continue
+        v = m.group(1).strip()
+        if key == "valid":
+            result[key] = v.upper() == "YES"
+        elif key in {"temporal", "type"}:
+            result[key] = v.upper()
+        elif v.lower() != "not mentioned":
+            result[key] = v
+
+    return result
+
+
+def normalize_verified_frequency(raw):
+    """
+    Deterministic normalization. Qwen identifies the raw expression; Python
+    performs arithmetic so model math cannot alter the result.
+    """
+    if not isinstance(raw, str):
+        return None
+
+    s = raw.lower().strip()
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s)
+
+    # Dedicated qualitative forms.
+    if re.search(r"\b(?:daily|every day|everyday|constant|continuous)\b", s):
+        if re.search(r"\bevery other day\b", s):
+            return "14/month"
+        return f"{DAYS_PER_MONTH}/month"
+
+    if re.search(r"\b(?:almost|nearly)\s+daily\b", s):
+        return f"{DAYS_PER_MONTH}/month"
+
+    if re.search(r"\bweekly\b", s) and not re.search(r"\d", s):
+        return "4/month"
+    if re.search(r"\bmonthly\b", s) and not re.search(r"\d", s):
+        return "1/month"
+
+    if re.search(r"\bonce\s+(?:a|per)\s+week\b", s):
+        return "4/month"
+    if re.search(r"\btwice\s+(?:a|per)\s+week\b", s):
+        return "8/month"
+
+    if re.search(r"\b(?:a\s+)?couple\b.*\bmonth\b", s):
+        return "2/month"
+    if re.search(r"\b(?:a\s+)?few\b.*\bmonth\b", s):
+        return "2-3/month"
+
+    # X/Y days => numerator per month.
+    m = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(?:28|30|31)\s*(?:days?)?", s)
+    if m:
+        return f"{m.group(1)}/month"
+
+    # Monthly numeric/range.
+    m = re.search(
+        r"(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?\s*"
+        r"(?:x|times?|days?|attacks?)?\s*(?:/|per\s+|a\s+)?"
+        r"(?:month|mo)\b",
+        s,
+    )
+    if m:
+        return (
+            f"{m.group(1)}-{m.group(2)}/month"
+            if m.group(2)
+            else f"{m.group(1)}/month"
+        )
+
+    # Weekly numeric/range.
+    m = re.search(
+        r"(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?\s*"
+        r"(?:x|times?|days?|attacks?)?\s*(?:/|per\s+|a\s+)?"
+        r"(?:week|wk)\b",
+        s,
+    )
+    if m:
+        lo = float(m.group(1)) * 4
+        hi = float(m.group(2)) * 4 if m.group(2) else None
+
+        def fmt(x):
+            return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+        return (
+            f"{fmt(lo)}-{fmt(hi)}/month"
+            if hi is not None
+            else f"{fmt(lo)}/month"
+        )
+
+    return None
+
+
+def migraine_evidence_gate(item):
+    """
+    V12 selective-recall migraine gate.
+
+    Preserve V11's high specificity while recovering additional true migraine
+    frequencies through tightly local evidence.
+
+    ACCEPT when any of the following is true:
+
+    A) The quantified evidence explicitly says migraine/migrainous.
+
+    B) Severe/debilitating/bad headache is locally and explicitly linked to
+       migraine.
+
+    C) A quantified generic headache statement occurs in the SAME local
+       structured migraine phenotype (e.g. Summary/Assessment/Impression).
+
+    D) A local transition explicitly describes the same migraine phenotype,
+       even if the numeric clause itself says only headache:
+          "migraines ... now 1-2 headaches/week"
+          "migraine without aura ... frequency 4-8/month"
+
+    E) The local passage explicitly states that headaches transition/become
+       migraine or that a quantified headache subset is migraine.
+
+    REJECT remote PMH/problem-list/family-history migraine mentions.
+    """
+    candidate = str(item.get("candidate") or "")
+    evidence = str(item.get("evidence") or "")
+    context = str(item.get("context") or "")
+    direct = f"{candidate} {evidence}"
+    local = f"{candidate} {evidence} {context}"
+
+    # A: explicit migraine terminology in quantified evidence.
+    if re.search(
+        r"(?i)\b(?:migraines?|migraine\s+attacks?|migraine\s+days?|migrainous)\b",
+        direct,
+    ):
+        return True, "A: explicit migraine terminology"
+
+    # Reject contexts that are only remote history/problem-list/family history.
+    remote = bool(re.search(
+        r"(?i)\b(?:family\s+history|mother|father|sister|brother|"
+        r"past\s+medical\s+history|problem\s+list|PMH)\b",
+        context,
+    ))
+    current_anchor = bool(re.search(
+        r"(?i)\b(?:current|currently|now|today|interval\s+history|"
+        r"frequency|assessment|impression|summary\s+of|headache\s+history)\b",
+        context,
+    ))
+    if remote and not current_anchor:
+        return False, "remote migraine mention only"
+
+    # B: severe/debilitating/bad headache locally linked to migraine.
+    severe = bool(re.search(
+        r"(?i)\b(?:severe|debilitating|bad)\s+"
+        r"(?:headaches?|ones?|attacks?|episodes?)\b",
+        direct,
+    ))
+    if severe and re.search(
+        r"""(?ix)
+        (?:severe|debilitating|bad).{0,180}\bmigraines?\b
+        |
+        \bmigraines?\b.{0,180}(?:severe|debilitating|bad)
+        |
+        (?:severe|debilitating|bad)\s+(?:headaches?|ones?)
+        .{0,120}(?:called?|considered?|represent|are|being|consistent\s+with)
+        .{0,40}\bmigraines?\b
+        """,
+        local,
+    ):
+        return True, "B: severe subset locally linked to migraine"
+
+    # Does the candidate actually quantify headache occurrence?
+    quantified_headache = bool(
+        HEADACHE_TERMS_RE.search(direct)
+        and FREQUENCY_ANCHOR_RE.search(direct)
+    )
+
+    # Strong local migraine phenotype.
+    migraine_phenotype = bool(re.search(
+        r"""(?ix)
+        \b(?:episodic|chronic)?\s*migraine(?:s)?
+        (?:\s+without\s+aura|\s+with\s+aura)?\b
+        |
+        \bmigraine\s+headaches?\b
+        |
+        \bsummary\s+of\s+migraine\s+headaches?\b
+        """,
+        local,
+    ))
+
+    # C: structured local phenotype linkage.
+    structured_link = bool(re.search(
+        r"""(?ix)
+        (?:assessment|impression|diagnosis)\s*:?\s*
+        (?:episodic|chronic)?\s*migraine
+        |
+        summary\s+of\s+(?:migraine\s+)?headaches?
+        |
+        headaches?.{0,120}(?:consistent\s+with|represent|are)
+        .{0,50}migraines?
+        """,
+        local,
+    ))
+    if quantified_headache and migraine_phenotype and structured_link:
+        return True, "C: quantified headache in same structured migraine phenotype"
+
+    # D: local current transition / shared phenotype.
+    # Allows a numeric headache clause when migraine is explicitly the topic
+    # within the same short passage.
+    transition_link = bool(re.search(
+        r"""(?ix)
+        \bmigraines?\b.{0,220}
+        (?:currently|now|frequency|occur|occurring|averag|having|gets?)
+        .{0,120}\bheadaches?\b
+        |
+        \bheadaches?\b.{0,160}
+        (?:migraine\s+without\s+aura|migraine\s+with\s+aura|migraines?)
+        .{0,120}(?:frequency|currently|now|occur)
+        """,
+        local,
+    ))
+    if quantified_headache and migraine_phenotype and transition_link:
+        return True, "D: local shared migraine/headache phenotype transition"
+
+    # E: explicit transformation/linkage between headache and migraine.
+    transformation = bool(re.search(
+        r"""(?ix)
+        headaches?.{0,120}(?:transition|transform|become|turn|progress)
+        .{0,80}migraines?
+        |
+        migraines?.{0,120}(?:present|manifest|occur)\s+as
+        .{0,80}headaches?
+        |
+        headache\s+subset.{0,100}migraines?
+        """,
+        local,
+    ))
+    if quantified_headache and transformation:
+        return True, "E: explicit headache-to-migraine linkage"
+
+    return False, "insufficient local migraine linkage"
+
+
+def validate_rescue_migraine_evidence(note, rescue):
+    """
+    V11 rescue gate: explicit migraine evidence is accepted; severe/generic
+    headache evidence can also pass when a narrow local neighborhood strongly
+    establishes the same phenotype as migraine.
+    """
+    if not rescue or rescue.get("frequency") == "Not mentioned":
+        return False, "no rescue frequency"
+
+    evidence = str(rescue.get("evidence") or "")
+    if not evidence or evidence.lower() == "not mentioned":
+        return False, "no quoted rescue evidence"
+
+    # Explicit migraine evidence.
+    if re.search(
+        r"(?i)\b(?:migraines?|migraine\s+attacks?|migraine\s+days?|migrainous)\b",
+        evidence,
+    ):
+        return True, "A: explicit migraine evidence in rescue"
+
+    # Locate evidence and use only a narrow neighborhood, preventing a remote
+    # migraine diagnosis from validating unrelated headache frequency.
+    idx = note.lower().find(evidence.lower())
+    if idx < 0:
+        return False, "rescue evidence not found verbatim in note"
+
+    local = note[max(0, idx - 320):min(len(note), idx + len(evidence) + 320)]
+
+    proxy_item = {
+        "candidate": evidence,
+        "evidence": evidence,
+        "context": local,
+    }
+    ok, reason = migraine_evidence_gate(proxy_item)
+    return ok, f"rescue {reason}"
+
+
+def choose_verified_frequency(verified, entity):
+    """
+    Select CURRENT verified candidates.
+
+    For migraine, apply an additional precision gate after Qwen verification.
+    This preserves V9's high-recall retrieval but prevents generic headache
+    frequency from being promoted to migraine frequency.
+    """
+    eligible = []
+
+    for item in verified:
+        if not item["valid"]:
+            continue
+        if item["temporal"] != "CURRENT":
+            continue
+        if item["type"] != "FREQUENCY":
+            continue
+
+        if entity == "migraine":
+            gate_ok, gate_reason = migraine_evidence_gate(item)
+            item["migraine_gate_pass"] = gate_ok
+            item["migraine_gate_reason"] = gate_reason
+            if not gate_ok:
+                continue
+
+        norm = normalize_verified_frequency(item["raw_frequency"])
+        if norm:
+            eligible.append((norm, item))
+
+    if not eligible:
+        return "Not mentioned", "Not mentioned", []
+
+    # Later current candidates are preferred, as in V9.
+    norm, best = eligible[-1]
+    return norm, best.get("evidence") or "Not mentioned", eligible
+
+
+def run_v9_entity_pass(note, entity, llm):
+    """
+    Separate entity-specific candidate retrieval and verification.
+    """
+    windows = retrieve_frequency_windows(note, entity)
+    if not windows:
+        return {
+            "frequency": "Not mentioned",
+            "evidence": "Not mentioned",
+            "candidates": [],
+            "verified": [],
+        }
+
+    # Candidate generation from retrieved windows.
+    candidate_prompts = [
+        CANDIDATE_PROMPT.format(entity=entity, context=w)
+        for w in windows
+    ]
+    candidate_outputs = run_prompts_batch(candidate_prompts, llm)
+
+    candidates = []
+    for w, out in zip(windows, candidate_outputs):
+        for c in parse_candidate_lines(out):
+            candidates.append({"candidate": c, "context": w})
+
+    # Deduplicate while preserving order.
+    dedup = []
+    seen = set()
+    for c in candidates:
+        key = c["candidate"].strip().lower()
+        if key not in seen:
+            seen.add(key)
+            dedup.append(c)
+    candidates = dedup
+
+    if not candidates:
+        return {
+            "frequency": "Not mentioned",
+            "evidence": "Not mentioned",
+            "candidates": [],
+            "verified": [],
+        }
+
+    verify_prompts = [
+        VERIFY_PROMPT.format(
+            entity=entity,
+            candidate=c["candidate"],
+            context=c["context"],
+        )
+        for c in candidates
+    ]
+    verify_outputs = run_prompts_batch(verify_prompts, llm)
+
+    verified = []
+    for c, out in zip(candidates, verify_outputs):
+        v = parse_verified_candidate(out)
+        v["candidate"] = c["candidate"]
+        v["context"] = c["context"]
+        v["raw_verifier_output"] = out
+        verified.append(v)
+
+    freq, evidence, eligible = choose_verified_frequency(verified, entity)
+
+    return {
+        "frequency": freq,
+        "evidence": evidence,
+        "candidates": candidates,
+        "verified": verified,
+        "eligible": eligible,
+    }
+
+
+def run_v9_rescue(note, entity, llm):
+    """
+    Second pass only when the entity remains Not mentioned.
+    """
+    label = "Headache" if entity == "headache" else "Migraine"
+    prompt = RESCUE_PROMPT.format(
+        entity=entity,
+        label=label,
+        context=note,
+    )
+    raw = run_prompts_batch([prompt], llm)[0]
+
+    pat = rf"{label}\s+frequency\s*:\s*(.+)"
+    m = re.search(pat, raw, flags=re.I)
+    freq = m.group(1).strip() if m else "Not mentioned"
+
+    evm = re.search(
+        rf"{label}\s+evidence\s*:\s*(.+)",
+        raw,
+        flags=re.I,
+    )
+    evidence = evm.group(1).strip() if evm else "Not mentioned"
+
+    tm = re.search(
+        rf"{label}\s+temporal\s+status\s*:\s*"
+        r"(CURRENT|HISTORICAL|UNCLEAR)",
+        raw,
+        flags=re.I,
+    )
+    temporal = tm.group(1).upper() if tm else "UNCLEAR"
+
+    if temporal != "CURRENT":
+        freq = "Not mentioned"
+
+    return {
+        "frequency": freq,
+        "evidence": evidence,
+        "temporal": temporal,
+        "raw_output": raw,
+    }
+
+
+def run_v9_note(note, llm):
+    """
+    Complete V9 extraction for one note.
+    """
+    h = run_v9_entity_pass(note, "headache", llm)
+    m = run_v9_entity_pass(note, "migraine", llm)
+
+    h_rescue = None
+    m_rescue = None
+
+    if h["frequency"] == "Not mentioned":
+        h_rescue = run_v9_rescue(note, "headache", llm)
+        if h_rescue["frequency"] != "Not mentioned":
+            h["frequency"] = h_rescue["frequency"]
+            h["evidence"] = h_rescue["evidence"]
+
+    if m["frequency"] == "Not mentioned":
+        m_rescue = run_v9_rescue(note, "migraine", llm)
+        gate_ok, gate_reason = validate_rescue_migraine_evidence(note, m_rescue)
+        m_rescue["migraine_gate_pass"] = gate_ok
+        m_rescue["migraine_gate_reason"] = gate_reason
+
+        if m_rescue["frequency"] != "Not mentioned" and gate_ok:
+            m["frequency"] = m_rescue["frequency"]
+            m["evidence"] = m_rescue["evidence"]
+
+    # Existing deterministic rules remain the final high-confidence QA/rescue.
+    det = deterministic_frequency_evidence_v3(note)
+
+    if det.get("headache") is not None:
+        h["frequency"] = det["headache"]
+    if det.get("migraine") is not None:
+        det_text = " ".join(det.get("evidence", []))
+        if re.search(
+            r"(?i)\b(?:migraines?|migraine\s+attacks?|migraine\s+days?|migrainous)\b",
+            det_text,
+        ):
+            m["frequency"] = det["migraine"]
+
+    # Final V11 migraine precision check.
+    # Do not require the word "migraine" on the evidence line itself; permit a
+    # strongly linked local phenotype, but reject remote diagnosis propagation.
+    if m["frequency"] != "Not mentioned":
+        final_ev = str(m.get("evidence") or "")
+        idx = note.lower().find(final_ev.lower()) if final_ev and final_ev.lower() != "not mentioned" else -1
+        local = (
+            note[max(0, idx - 320):min(len(note), idx + len(final_ev) + 320)]
+            if idx >= 0 else final_ev
+        )
+        proxy = {
+            "candidate": final_ev,
+            "evidence": final_ev,
+            "context": local,
+        }
+        gate_ok, gate_reason = migraine_evidence_gate(proxy)
+
+        # Deterministic explicit migraine evidence remains an alternative path.
+        det_text = " ".join(det.get("evidence", []))
+        det_explicit = bool(re.search(
+            r"(?i)\b(?:migraines?|migraine\s+attacks?|migraine\s+days?|migrainous)\b",
+            det_text,
+        ))
+
+        if not gate_ok and not det_explicit:
+            m["frequency"] = "Not mentioned"
+
+
+    return {
+        "headache_frequency": h["frequency"],
+        "migraine_frequency": m["frequency"],
+        "headache_evidence": h["evidence"],
+        "migraine_evidence": m["evidence"],
+        "headache_candidates": h.get("candidates", []),
+        "migraine_candidates": m.get("candidates", []),
+        "headache_verified": h.get("verified", []),
+        "migraine_verified": m.get("verified", []),
+        "headache_rescue": h_rescue,
+        "migraine_rescue": m_rescue,
+        "deterministic_evidence": det.get("evidence", []),
+    }
+
 # ======================================================
 # LOAD MODEL
 # ======================================================
 
 def load_model():
-
-    print("Loading model...")
+    print("Loading Qwen3-14B model...")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -504,33 +1170,21 @@ def load_model():
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto",
-    )
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    # Decoder-only models need a pad token and LEFT padding for
-    # correct batched generation (so all sequences finish generating
-    # aligned at the right edge).
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    llm = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        do_sample=False,
-        max_new_tokens=MAX_NEW_TOKENS,
-        return_full_text=False,
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
     )
+    model.eval()
 
     print("Model loaded.")
-
-    return llm
+    return {"model": model, "tokenizer": tokenizer}
 
 
 # ======================================================
@@ -539,53 +1193,76 @@ def load_model():
 
 def run_prompts_batch(prompts, llm):
     """
-    Run the LLM on a list of ALREADY-BUILT prompts and return the
-    cleaned generated text for each, in the same order. Used both for
-    chunk-level extraction prompts and for consolidation prompts.
+    Qwen3 batched generation using the official chat template.
+    Non-thinking mode is used because this task requires short, constrained
+    structured extraction rather than visible chain-of-thought.
     """
-
     if not prompts:
         return []
 
-    try:
+    model = llm["model"]
+    tokenizer = llm["tokenizer"]
 
-        outputs = llm(
-            prompts,
-            batch_size=len(prompts),
+    try:
+        chat_prompts = []
+        for prompt in prompts:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract clinical headache and migraine frequency. "
+                        "Follow the requested output schema exactly. /no_think"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            chat_prompts.append(rendered)
+
+        inputs = tokenizer(
+            chat_prompts,
+            return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=MAX_INPUT_TOKENS,
-        )
+        ).to(model.device)
 
+        with torch.inference_mode():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        input_len = inputs["input_ids"].shape[1]
         results = []
-
-        for output in outputs:
-
-            if isinstance(output, list):
-                generated = output[0]["generated_text"]
-            else:
-                generated = output["generated_text"]
-
-            # The model can occasionally emit non-ASCII characters
-            # (smart quotes, special dashes, etc.) even though the
-            # input was cleaned. Strip those here too so downstream
-            # parsing/regex and the saved CSV stay ASCII-only.
-            results.append(clean_text(generated.strip()))
-
+        for seq in generated:
+            answer = tokenizer.decode(
+                seq[input_len:],
+                skip_special_tokens=True,
+            ).strip()
+            answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+            results.append(clean_text(answer))
         return results
 
     except torch.cuda.OutOfMemoryError:
-
         torch.cuda.empty_cache()
-
         return [
-            "Headache frequency: CUDA Out of Memory\n"
+            "Headache frequency: CUDA Out of Memory\\n"
             "Migraine frequency: CUDA Out of Memory"
         ] * len(prompts)
 
     except Exception as e:
-
+        print(f"Generation error: {type(e).__name__}: {e}")
         return [
-            "Headache frequency: ERROR\n"
+            "Headache frequency: ERROR\\n"
             "Migraine frequency: ERROR"
         ] * len(prompts)
 
@@ -623,28 +1300,81 @@ def generate_batch(contexts, llm):
     return results
 
 
-def run_in_batches(items, fn, batch_size, llm, desc):
+def run_in_batches(
+    items,
+    fn,
+    batch_size,
+    llm,
+    desc,
+    checkpoint_callback=None,
+):
     """
-    Apply `fn(batch, llm) -> list[result]` to `items` in chunks of
-    `batch_size`, with a progress bar, and return the flattened
-    results in original order.
-    """
+    Apply fn(batch, llm) to items in batches.
 
+    If checkpoint_callback is provided, it is called after each completed
+    batch. This makes long GPU jobs resumable/inspectable instead of waiting
+    until the entire script finishes before anything is saved.
+    """
     results = [None] * len(items)
-
     n_batches = (len(items) + batch_size - 1) // batch_size
 
-    for batch_start in tqdm(
-        range(0, len(items), batch_size),
-        total=n_batches,
-        desc=desc,
+    for batch_number, batch_start in enumerate(
+        tqdm(
+            range(0, len(items), batch_size),
+            total=n_batches,
+            desc=desc,
+        ),
+        start=1,
     ):
         batch_end = min(batch_start + batch_size, len(items))
         batch = items[batch_start:batch_end]
-        results[batch_start:batch_end] = fn(batch, llm)
+
+        try:
+            batch_results = fn(batch, llm)
+            results[batch_start:batch_end] = batch_results
+
+        except KeyboardInterrupt:
+            print(f"\n[INTERRUPTED] {desc} stopped at batch {batch_number}.")
+            if checkpoint_callback is not None:
+                checkpoint_callback(
+                    batch_number,
+                    batch_start,
+                    batch_end,
+                    results,
+                    interrupted=True,
+                )
+            raise
+
+        except Exception as e:
+            print(
+                f"\n[BATCH ERROR] {desc}, batch {batch_number}: "
+                f"{type(e).__name__}: {e}"
+            )
+            traceback.print_exc()
+
+            if checkpoint_callback is not None:
+                checkpoint_callback(
+                    batch_number,
+                    batch_start,
+                    batch_end,
+                    results,
+                    interrupted=True,
+                )
+            raise
+
+        if (
+            checkpoint_callback is not None
+            and batch_number % CHECKPOINT_EVERY_BATCHES == 0
+        ):
+            checkpoint_callback(
+                batch_number,
+                batch_start,
+                batch_end,
+                results,
+                interrupted=False,
+            )
 
     return results
-
 
 
 # ======================================================
@@ -1340,6 +2070,40 @@ def extract_frequencies(text):
     return h, m
 
 
+
+def extract_structured_llm_output(text):
+    """Parse V9 evidence-first model output while remaining backward compatible."""
+    h, m = extract_frequencies(text)
+    result = {
+        "headache": h,
+        "migraine": m,
+        "headache_evidence": "Not mentioned",
+        "migraine_evidence": "Not mentioned",
+        "headache_temporal": "UNCLEAR",
+        "migraine_temporal": "UNCLEAR",
+    }
+    if not isinstance(text, str):
+        return result
+
+    fields = {
+        "headache_evidence": r"Headache\s+evidence\s*:\s*(.+)",
+        "migraine_evidence": r"Migraine\s+evidence\s*:\s*(.+)",
+        "headache_temporal": r"Headache\s+temporal\s+status\s*:\s*(CURRENT|HISTORICAL|UNCLEAR)",
+        "migraine_temporal": r"Migraine\s+temporal\s+status\s*:\s*(CURRENT|HISTORICAL|UNCLEAR)",
+    }
+    for key, pat in fields.items():
+        mm = re.search(pat, text, flags=re.IGNORECASE)
+        if mm:
+            value = mm.group(1).strip()
+            result[key] = value.upper() if key.endswith("temporal") else value
+
+    # Reject a frequency explicitly labeled historical.
+    if result["headache_temporal"] == "HISTORICAL":
+        result["headache"] = "Not mentioned"
+    if result["migraine_temporal"] == "HISTORICAL":
+        result["migraine"] = "Not mentioned"
+    return result
+
 def build_consolidation_prompt(candidates):
     """
     Build the consolidation prompt listing each chunk-level candidate
@@ -1370,7 +2134,69 @@ def build_consolidation_prompt(candidates):
 # LOAD MODEL
 # ======================================================
 
+
 llm = load_model()
+
+# ======================================================
+# V9 ENTITY-SPECIFIC HIGH-RECALL EXTRACTION
+# ======================================================
+
+print("Running V12 headache/migraine candidate + verification pipeline...")
+
+v9_results = []
+try:
+    for note_i, note in enumerate(
+        tqdm(df[NOTE_COLUMN].tolist(), desc="V12 note extraction")
+    ):
+        if not isinstance(note, str) or not note.strip():
+            result = {
+                "headache_frequency": "Not mentioned",
+                "migraine_frequency": "Not mentioned",
+                "headache_evidence": "Not mentioned",
+                "migraine_evidence": "Not mentioned",
+                "headache_candidates": [],
+                "migraine_candidates": [],
+                "headache_verified": [],
+                "migraine_verified": [],
+                "headache_rescue": None,
+                "migraine_rescue": None,
+                "deterministic_evidence": [],
+            }
+        else:
+            result = run_v9_note(note, llm)
+
+        v9_results.append(result)
+
+        # Update dataframe immediately so every completed note is recoverable.
+        df.loc[note_i, "headache_frequency_IB"] = result["headache_frequency"]
+        df.loc[note_i, "migraine_frequency_IB"] = result["migraine_frequency"]
+        df.loc[note_i, "deterministic_evidence_IB"] = "\n".join(
+            result["deterministic_evidence"]
+        )
+
+        save_checkpoint(
+            df,
+            OUTPUT_FILE,
+            label=f"V12 note {note_i + 1}/{len(df)}",
+        )
+
+except KeyboardInterrupt:
+    safe_partial_save(df, OUTPUT_FILE, label="V12 interrupted")
+    raise
+except Exception:
+    safe_partial_save(df, OUTPUT_FILE, label="V12 exception")
+    traceback.print_exc()
+    raise
+
+save_checkpoint(df, OUTPUT_FILE, label="V12 FINAL")
+
+print("V12 extraction complete.")
+print(f"Output saved to: {OUTPUT_FILE}")
+
+# V9 is a complete extraction pipeline. Stop here so the legacy chunk pipeline
+# below does not overwrite the V9 results.
+raise SystemExit(0)
+
 
 
 # ======================================================
@@ -1394,6 +2220,50 @@ print(f"Total notes: {n_notes:,}")
 print(f"Total chunks: {len(flat_chunks):,}")
 
 
+
+def save_chunk_progress(
+    batch_number,
+    batch_start,
+    batch_end,
+    partial_results,
+    interrupted=False,
+):
+    """
+    Persist raw chunk-generation progress to a sidecar CSV.
+
+    Final note-level frequencies cannot be computed until all chunks for a note
+    are reconciled, so chunk progress is saved separately without corrupting
+    the main output schema.
+    """
+    progress_file = OUTPUT_FILE + ".chunks_checkpoint.csv"
+
+    completed_rows = []
+    for flat_i, raw in enumerate(partial_results):
+        if raw is None:
+            continue
+        completed_rows.append({
+            "flat_chunk_index": flat_i,
+            "note_index": chunk_note_idx[flat_i],
+            "raw_output": raw,
+        })
+
+    if completed_rows:
+        progress_df = pd.DataFrame(completed_rows)
+        tmp = progress_file + ".tmp"
+        progress_df.to_csv(tmp, index=False)
+        os.replace(tmp, progress_file)
+
+    # Also keep the main CSV present at the requested OUTPUT_FILE.
+    save_checkpoint(
+        df,
+        OUTPUT_FILE,
+        label=(
+            f"chunk batch {batch_number}"
+            + (" interrupted" if interrupted else "")
+        ),
+    )
+
+
 # ======================================================
 # STEP 2: RUN LLM ON EVERY CHUNK (BATCHED)
 # ======================================================
@@ -1406,15 +2276,18 @@ chunk_raw_outputs = run_in_batches(
     BATCH_SIZE,
     llm,
     desc="Chunk extraction",
+    checkpoint_callback=save_chunk_progress,
 )
 
 chunk_headache = []
 chunk_migraine = []
 
+chunk_structured = []
 for raw in chunk_raw_outputs:
-    h, m = extract_frequencies(raw)
-    chunk_headache.append(h)
-    chunk_migraine.append(m)
+    parsed = extract_structured_llm_output(raw)
+    chunk_structured.append(parsed)
+    chunk_headache.append(parsed["headache"])
+    chunk_migraine.append(parsed["migraine"])
 
 
 # ======================================================
@@ -1438,8 +2311,14 @@ for flat_i, note_i in enumerate(chunk_note_idx):
         "migraine": m,
         "chunk_text": flat_chunks[flat_i],
         "raw_output": chunk_raw_outputs[flat_i],
+        "headache_evidence": chunk_structured[flat_i]["headache_evidence"],
+        "migraine_evidence": chunk_structured[flat_i]["migraine_evidence"],
+        "headache_temporal": chunk_structured[flat_i]["headache_temporal"],
+        "migraine_temporal": chunk_structured[flat_i]["migraine_temporal"],
     })
 
+
+save_checkpoint(df, OUTPUT_FILE, label="chunk extraction complete")
 
 # ======================================================
 # STEP 4: CONSOLIDATE CANDIDATES PER NOTE
@@ -1620,9 +2499,16 @@ if cc_metrics:
 # SAVE
 # ======================================================
 
-df.to_csv(
-    OUTPUT_FILE,
-    index=False,
+save_checkpoint(df, OUTPUT_FILE, label="FINAL")
+
+if not os.path.exists(OUTPUT_FILE):
+    raise RuntimeError(
+        f"Final output file was not created: {OUTPUT_FILE}"
+    )
+
+print(
+    f"[VERIFY] Final CSV exists: {OUTPUT_FILE}\n"
+    f"[VERIFY] Size: {os.path.getsize(OUTPUT_FILE):,} bytes"
 )
 
 print("\n======================================")
